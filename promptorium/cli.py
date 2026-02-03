@@ -21,13 +21,63 @@ def _service() -> PromptService:
 
 
 @app.command()
-def add(
-    key: str | None = typer.Option(None, "--key"),
-    directory: Path | None = typer.Option(None, "--dir", help="Custom directory for versions"),
+def track(
+    source: Path = typer.Argument(..., help="Path to the source file to track"),
+    key: str | None = typer.Option(None, "--key", help="Key for the prompt"),
+    version_dir: Path | None = typer.Option(None, "--version-dir", help="Custom version dir"),
 ) -> None:
+    """Track an existing file as a prompt source."""
     try:
-        ref = _service().add_prompt(key, directory)
-        typer.echo(f"Created prompt '{ref.key}' at {ref.base_dir}")
+        ref, initial_ver = _service().track_source(source, key, version_dir)
+        typer.echo(f"Tracking '{ref.key}' from {ref.source_file}")
+        if initial_ver:
+            typer.echo(f"  Initial version: v{initial_ver.version}")
+    except PromptError as e:
+        typer.secho(str(e), err=True, fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@app.command()
+def sync(
+    key: str | None = typer.Argument(None, help="Key to sync (or all if omitted)"),
+    force: bool = typer.Option(False, "--force", help="Create version even if unchanged"),
+) -> None:
+    """Sync source file(s) to create new versions if changed."""
+    svc = _service()
+    try:
+        if key:
+            result = svc.sync_prompt(key, force)
+            if result.changed:
+                typer.echo(f"Synced '{key}': v{result.old_version} -> v{result.new_version}")
+            else:
+                typer.echo(f"No changes for '{key}' (at v{result.old_version})")
+        else:
+            results = svc.sync_all()
+            if not results:
+                typer.echo("No source-tracked prompts found.")
+                return
+            for r in results:
+                if r.changed:
+                    typer.echo(f"Synced '{r.key}': v{r.old_version} -> v{r.new_version}")
+                else:
+                    typer.echo(f"Unchanged: '{r.key}' (at v{r.old_version})")
+    except PromptError as e:
+        typer.secho(str(e), err=True, fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+
+@app.command()
+def untrack(
+    key: str = typer.Argument(..., help="Key to untrack"),
+    keep_versions: bool = typer.Option(True, "--keep-versions/--delete-versions"),
+) -> None:
+    """Stop tracking a source file (optionally keep version history)."""
+    try:
+        _service().untrack_source(key, keep_versions)
+        if keep_versions:
+            typer.echo(f"Untracked '{key}' (versions kept)")
+        else:
+            typer.echo(f"Untracked '{key}' (versions deleted)")
     except PromptError as e:
         typer.secho(str(e), err=True, fg=typer.colors.RED)
         raise typer.Exit(1)
@@ -39,6 +89,7 @@ def update(
     file: Path | None = typer.Option(None, "--file", help="Read prompt text from file"),
     edit: bool = typer.Option(False, "--edit", help="Open $EDITOR to edit the prompt text"),
 ) -> None:
+    """Update a prompt with new content (writes to source file and creates version)."""
     svc = _service()
     try:
         if file is not None and edit:
@@ -70,19 +121,23 @@ def update(
 
 @app.command("list")
 def list_() -> None:
+    """List all tracked prompts with their source files and versions."""
     infos = _service().list_prompts()
     if not infos:
         typer.echo("No prompts tracked.")
         raise typer.Exit()
     for info in infos:
-        typer.echo(f"\n{info.ref.key}  @  {info.ref.base_dir}")
+        typer.echo(f"\n{info.ref.key}")
+        typer.echo(f"  Source: {info.ref.source_file}")
+        typer.echo(f"  Versions: {info.ref.version_dir}")
         for v in info.versions:
-            typer.echo(f"  - v{v.version}: {v.path}")
+            typer.echo(f"    - v{v.version}: {v.path}")
     typer.echo("")
 
 
 @app.command()
 def delete(key: str, all: bool = typer.Option(False, "--all")) -> None:  # noqa: A002 - match CLI spec
+    """Delete a prompt's versions (latest or all)."""
     svc = _service()
     try:
         if all:
@@ -98,6 +153,7 @@ def delete(key: str, all: bool = typer.Option(False, "--all")) -> None:  # noqa:
 
 @app.command()
 def load(key: str, version: int | None = typer.Option(None, "--version")) -> None:
+    """Load and print the content of a prompt."""
     try:
         typer.echo(_service().load_prompt(key, version))
     except PromptError as e:
@@ -112,6 +168,7 @@ def diff(
     v2: int,
     granularity: str = typer.Option("word", "--granularity", "--g"),
 ) -> None:
+    """Show differences between two versions of a prompt."""
     try:
         res = _service().diff_versions(key, v1, v2, granularity=granularity)
         render_diff_to_console(res)
