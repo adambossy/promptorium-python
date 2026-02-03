@@ -41,13 +41,18 @@ repository = "https://github.com/adambossy/promptorium-python"
 
 [project.scripts]
 prompts = "promptorium.cli:app"
+prompts-mcp = "promptorium.mcp_server:run_server"
 
 [project.optional-dependencies]
+mcp = [
+  "mcp>=1.2.0",
+]
 dev = [
   "pytest>=8.0",
   "mypy>=1.10",
   "ruff>=0.5.0",
   "pre-commit>=3.7",
+  "mcp>=1.2.0",
 ]
 
 [tool.pytest.ini_options]
