@@ -12,6 +12,7 @@ from .domain import (
     PromptInfo,
     PromptRef,
     PromptVersion,
+    SyncResult,
 )
 from .storage.base import StoragePort
 from .util.diff import build_inline_diff
@@ -23,7 +24,17 @@ class PromptService:
         self.s = storage
         self.s.ensure_initialized()
 
-    def add_prompt(self, key: str | None = None, directory: Path | None = None) -> PromptRef:
+    def track_source(
+        self,
+        source_file: Path,
+        key: str | None = None,
+        version_dir: Path | None = None,
+    ) -> tuple[PromptRef, PromptVersion | None]:
+        """
+        Track a source file as a prompt.
+        Creates initial version from current content.
+        Returns (ref, initial_version).
+        """
         if key is None:
             key = generate_unique_key(self.s)
         if not is_valid_key(key):
@@ -31,17 +42,40 @@ class PromptService:
         if self.s.key_exists(key):
             ref = self.s.get_prompt_ref(key)
             raise PromptAlreadyExists(
-                f"Prompt with key '{key}' already exists in directory '{ref.base_dir}'. "
-                "Use a different --key or delete the existing prompt using --all first."
+                f"Prompt with key '{key}' already exists with source '{ref.source_file}'. "
+                "Use a different --key or untrack the existing prompt first."
             )
-        return self.s.add_prompt(key, directory)
+        ref = self.s.track_source(key, source_file, version_dir)
+        # Return the initial version (version 1)
+        pairs = self.s.list_prompts()
+        for info in pairs:
+            if info.ref.key == key and info.versions:
+                return ref, info.versions[-1]
+        return ref, None
 
     def update_prompt(self, key: str, content: str) -> PromptVersion:
+        """Update prompt with new content (writes to source file and creates version)."""
         if not content:
             raise NoContentProvided("No prompt text provided.")
         # Ensure key exists
         self.s.get_prompt_ref(key)
         return self.s.write_new_version(key, content)
+
+    def sync_prompt(self, key: str, force: bool = False) -> SyncResult:
+        """Sync a single prompt from its source file."""
+        return self.s.sync_from_source(key, force)
+
+    def sync_all(self) -> list[SyncResult]:
+        """Sync all source-tracked prompts."""
+        return self.s.sync_all_sources()
+
+    def untrack_source(self, key: str, keep_versions: bool = True) -> None:
+        """Remove source tracking for a prompt."""
+        self.s.untrack(key, keep_versions)
+
+    def list_source_files(self) -> list[tuple[str, Path]]:
+        """Return list of (key, source_file_path) tuples for all tracked prompts."""
+        return self.s.list_source_files()
 
     def list_prompts(self) -> Sequence[PromptInfo]:
         return self.s.list_prompts()
