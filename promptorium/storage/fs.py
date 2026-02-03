@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -7,22 +8,33 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..domain import (
+    PromptAlreadyExists,
     PromptInfo,
     PromptNotFound,
     PromptRef,
     PromptVersion,
+    SourceFileNotFound,
+    SyncResult,
     VersionNotFound,
 )
 from ..util.io_safety import atomic_write_text
 from .base import StoragePort
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+
+
+@dataclass
+class _PromptConfig:
+    source_file: str  # relative or absolute path
+    version_dir: str  # relative or absolute path
+    last_hash: str | None
+    last_version: int
 
 
 @dataclass
 class _Meta:
     schema: int
-    custom_dirs: dict[str, str]
+    prompts: dict[str, _PromptConfig]
 
 
 class FileSystemPromptStorage(StoragePort):
@@ -34,208 +46,335 @@ class FileSystemPromptStorage(StoragePort):
     # --- helpers ---
     def _load_meta(self) -> _Meta:
         if not self._meta_path.exists():
-            return _Meta(schema=_SCHEMA_VERSION, custom_dirs={})
+            return _Meta(schema=_SCHEMA_VERSION, prompts={})
         data = json.loads(self._meta_path.read_text(encoding="utf-8"))
         schema = int(data.get("schema", 0))
         if schema != _SCHEMA_VERSION:
-            # For now, treat mismatch as empty mapping
-            return _Meta(schema=_SCHEMA_VERSION, custom_dirs=dict(data.get("custom_dirs", {})))
-        return _Meta(schema=schema, custom_dirs=dict(data.get("custom_dirs", {})))
+            raise ValueError(
+                f"Unsupported schema version {schema}. Expected {_SCHEMA_VERSION}. "
+                "Run the migration script to upgrade."
+            )
+        prompts: dict[str, _PromptConfig] = {}
+        for key, cfg in data.get("prompts", {}).items():
+            prompts[key] = _PromptConfig(
+                source_file=cfg["source_file"],
+                version_dir=cfg["version_dir"],
+                last_hash=cfg.get("last_hash"),
+                last_version=cfg.get("last_version", 0),
+            )
+        return _Meta(schema=schema, prompts=prompts)
 
     def _save_meta(self, meta: _Meta) -> None:
-        payload = {"schema": meta.schema, "custom_dirs": meta.custom_dirs}
+        prompts_data = {}
+        for key, cfg in meta.prompts.items():
+            prompts_data[key] = {
+                "source_file": cfg.source_file,
+                "version_dir": cfg.version_dir,
+                "last_hash": cfg.last_hash,
+                "last_version": cfg.last_version,
+            }
+        payload = {"schema": meta.schema, "prompts": prompts_data}
         atomic_write_text(self._meta_path, json.dumps(payload, indent=2) + "\n")
 
-    def _resolve_dir_value(self, value: str) -> Path:
+    def _resolve_path(self, value: str) -> Path:
+        """Resolve a stored path to an absolute path."""
         p = Path(value)
         if p.is_absolute():
             return p
         return (self.repo_root / p).resolve()
 
-    def _store_dir_value(self, path: Path) -> str:
+    def _store_path(self, path: Path) -> str:
+        """Store a path as relative if possible, otherwise absolute."""
         try:
             rel = path.resolve().relative_to(self.repo_root)
             return rel.as_posix()
-        except Exception:
+        except ValueError:
             return str(path.resolve())
 
-    def _default_key_dir(self, key: str) -> Path:
+    def _default_version_dir(self, key: str) -> Path:
         return self.root / key
 
-    def _is_default_managed(self, base_dir: Path) -> bool:
+    def _is_managed_by_root(self, version_dir: Path) -> bool:
         try:
-            base_dir.resolve().relative_to(self.root)
+            version_dir.resolve().relative_to(self.root)
             return True
-        except Exception:
+        except ValueError:
             return False
 
-    def _custom_dir_for_key(self, key: str) -> Path | None:
-        meta = self._load_meta()
-        d = meta.custom_dirs.get(key)
-        if d is None:
-            return None
-        return self._resolve_dir_value(d)
+    def _compute_hash(self, content: str) -> str:
+        """Compute SHA256 hash of content."""
+        return f"sha256:{hashlib.sha256(content.encode('utf-8')).hexdigest()}"
 
-    def _scan_default_versions(self, key: str) -> list[tuple[int, Path]]:
-        base = self._default_key_dir(key)
-        if not base.exists():
+    def _scan_versions(
+        self, key: str, version_dir: Path, managed_by_root: bool
+    ) -> list[tuple[int, Path]]:
+        """Scan a directory for version files."""
+        if not version_dir.exists():
             return []
         versions: list[tuple[int, Path]] = []
-        for p in base.iterdir():
-            if not p.is_file():
-                continue
-            if re.fullmatch(r"\d+\.md", p.name):
-                n = int(p.stem)
-                versions.append((n, p))
+        if managed_by_root:
+            # Default: <version_dir>/<n>.md
+            for p in version_dir.iterdir():
+                if p.is_file() and re.fullmatch(r"\d+\.md", p.name):
+                    n = int(p.stem)
+                    versions.append((n, p))
+        else:
+            # Custom: <version_dir>/<key>-<n>.md
+            pattern = re.compile(rf"^{re.escape(key)}-(\d+)\.md$")
+            for p in version_dir.iterdir():
+                if p.is_file():
+                    m = pattern.fullmatch(p.name)
+                    if m:
+                        n = int(m.group(1))
+                        versions.append((n, p))
         versions.sort(key=lambda t: t[0])
         return versions
 
-    def _scan_custom_versions(self, key: str, base_dir: Path) -> list[tuple[int, Path]]:
-        pattern = re.compile(rf"^{re.escape(key)}-(\d+)\.md$")
-        versions: list[tuple[int, Path]] = []
-        if not base_dir.exists():
-            return []
-        for p in base_dir.iterdir():
-            if not p.is_file():
-                continue
-            m = pattern.fullmatch(p.name)
-            if m:
-                n = int(m.group(1))
-                versions.append((n, p))
-        versions.sort(key=lambda t: t[0])
-        return versions
+    def _next_version(self, key: str, version_dir: Path, managed_by_root: bool) -> int:
+        pairs = self._scan_versions(key, version_dir, managed_by_root)
+        return (pairs[-1][0] + 1) if pairs else 1
+
+    def _version_path(
+        self, key: str, version: int, version_dir: Path, managed_by_root: bool
+    ) -> Path:
+        if managed_by_root:
+            return version_dir / f"{version}.md"
+        return version_dir / f"{key}-{version}.md"
 
     # --- API ---
     def ensure_initialized(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         if not self._meta_path.exists():
-            self._save_meta(_Meta(schema=_SCHEMA_VERSION, custom_dirs={}))
+            self._save_meta(_Meta(schema=_SCHEMA_VERSION, prompts={}))
 
     def key_exists(self, key: str) -> bool:
-        if (self.root / key).is_dir():
-            return True
         meta = self._load_meta()
-        return key in meta.custom_dirs
+        return key in meta.prompts
 
-    def add_prompt(self, key: str, custom_dir: Path | None) -> PromptRef:
+    def track_source(self, key: str, source_file: Path, version_dir: Path | None) -> PromptRef:
         self.ensure_initialized()
-        if custom_dir is None:
-            base = self._default_key_dir(key)
-            base.mkdir(parents=True, exist_ok=True)
-            return PromptRef(key=key, base_dir=base, managed_by_root=True)
-
-        base = (
-            (self.repo_root / custom_dir).resolve()
-            if not custom_dir.is_absolute()
-            else custom_dir.resolve()
-        )
-        base.mkdir(parents=True, exist_ok=True)
         meta = self._load_meta()
-        meta.custom_dirs[key] = self._store_dir_value(base)
+
+        if key in meta.prompts:
+            raise PromptAlreadyExists(f"Prompt key '{key}' already exists.")
+
+        # Resolve source file
+        source_path = (
+            (self.repo_root / source_file).resolve()
+            if not source_file.is_absolute()
+            else source_file.resolve()
+        )
+        if not source_path.exists():
+            raise SourceFileNotFound(f"Source file not found: {source_path}")
+
+        # Resolve version directory
+        if version_dir is None:
+            ver_dir = self._default_version_dir(key)
+        else:
+            ver_dir = (
+                (self.repo_root / version_dir).resolve()
+                if not version_dir.is_absolute()
+                else version_dir.resolve()
+            )
+        ver_dir.mkdir(parents=True, exist_ok=True)
+
+        managed_by_root = self._is_managed_by_root(ver_dir)
+
+        # Read source content and create initial version
+        content = source_path.read_text(encoding="utf-8")
+        content_hash = self._compute_hash(content)
+        next_ver = self._next_version(key, ver_dir, managed_by_root)
+        version_path = self._version_path(key, next_ver, ver_dir, managed_by_root)
+        atomic_write_text(version_path, content)
+
+        # Save metadata
+        meta.prompts[key] = _PromptConfig(
+            source_file=self._store_path(source_path),
+            version_dir=self._store_path(ver_dir),
+            last_hash=content_hash,
+            last_version=next_ver,
+        )
         self._save_meta(meta)
-        return PromptRef(key=key, base_dir=base, managed_by_root=False)
+
+        return PromptRef(
+            key=key,
+            source_file=source_path,
+            version_dir=ver_dir,
+            managed_by_root=managed_by_root,
+        )
 
     def get_prompt_ref(self, key: str) -> PromptRef:
-        custom = self._custom_dir_for_key(key)
-        if custom is not None:
-            return PromptRef(key=key, base_dir=custom, managed_by_root=False)
-        base = self._default_key_dir(key)
-        if base.exists():
-            return PromptRef(key=key, base_dir=base, managed_by_root=True)
-        raise PromptNotFound(key)
+        meta = self._load_meta()
+        if key not in meta.prompts:
+            raise PromptNotFound(key)
+        cfg = meta.prompts[key]
+        source_path = self._resolve_path(cfg.source_file)
+        ver_dir = self._resolve_path(cfg.version_dir)
+        return PromptRef(
+            key=key,
+            source_file=source_path,
+            version_dir=ver_dir,
+            managed_by_root=self._is_managed_by_root(ver_dir),
+        )
 
     def list_prompts(self) -> Sequence[PromptInfo]:
         self.ensure_initialized()
         meta = self._load_meta()
 
-        keys: dict[str, PromptRef] = {}
-        # default-managed keys
-        if self.root.exists():
-            for p in self.root.iterdir():
-                if p.is_dir() and p.name != "__pycache__":
-                    keys[p.name] = PromptRef(key=p.name, base_dir=p, managed_by_root=True)
-        # custom-managed keys
-        for key, dirval in meta.custom_dirs.items():
-            base = self._resolve_dir_value(dirval)
-            keys[key] = PromptRef(key=key, base_dir=base, managed_by_root=False)
-
         infos: list[PromptInfo] = []
-        for key, ref in sorted(keys.items(), key=lambda kv: kv[0]):
-            if ref.managed_by_root:
-                pairs = self._scan_default_versions(key)
-            else:
-                pairs = self._scan_custom_versions(key, ref.base_dir)
+        for key in sorted(meta.prompts.keys()):
+            cfg = meta.prompts[key]
+            source_path = self._resolve_path(cfg.source_file)
+            ver_dir = self._resolve_path(cfg.version_dir)
+            managed_by_root = self._is_managed_by_root(ver_dir)
+            ref = PromptRef(
+                key=key,
+                source_file=source_path,
+                version_dir=ver_dir,
+                managed_by_root=managed_by_root,
+            )
+            pairs = self._scan_versions(key, ver_dir, managed_by_root)
             versions = [PromptVersion(key=key, version=n, path=path) for n, path in pairs]
             infos.append(PromptInfo(ref=ref, versions=versions))
         return infos
 
-    def _next_version(self, key: str, ref: PromptRef) -> int:
-        if ref.managed_by_root:
-            pairs = self._scan_default_versions(key)
-        else:
-            pairs = self._scan_custom_versions(key, ref.base_dir)
-        return (pairs[-1][0] + 1) if pairs else 1
-
     def write_new_version(self, key: str, content: str) -> PromptVersion:
+        """Write a new version from provided content (updates source file too)."""
         ref = self.get_prompt_ref(key)
-        next_ver = self._next_version(key, ref)
-        if ref.managed_by_root:
-            path = ref.base_dir / f"{next_ver}.md"
-        else:
-            path = ref.base_dir / f"{key}-{next_ver}.md"
-        atomic_write_text(path, content)
-        return PromptVersion(key=key, version=next_ver, path=path)
+        meta = self._load_meta()
+        cfg = meta.prompts[key]
 
-    def _latest_version_pair(self, key: str, ref: PromptRef) -> tuple[int, Path]:
-        pairs = (
-            self._scan_default_versions(key)
-            if ref.managed_by_root
-            else self._scan_custom_versions(key, ref.base_dir)
-        )
-        if not pairs:
-            raise VersionNotFound(f"No versions for key: {key}")
-        return pairs[-1]
+        # Write to source file
+        atomic_write_text(ref.source_file, content)
+
+        # Create new version
+        next_ver = self._next_version(key, ref.version_dir, ref.managed_by_root)
+        version_path = self._version_path(key, next_ver, ref.version_dir, ref.managed_by_root)
+        atomic_write_text(version_path, content)
+
+        # Update metadata
+        cfg.last_hash = self._compute_hash(content)
+        cfg.last_version = next_ver
+        self._save_meta(meta)
+
+        return PromptVersion(key=key, version=next_ver, path=version_path)
 
     def delete_latest(self, key: str) -> PromptVersion:
         ref = self.get_prompt_ref(key)
-        ver, path = self._latest_version_pair(key, ref)
+        pairs = self._scan_versions(key, ref.version_dir, ref.managed_by_root)
+        if not pairs:
+            raise VersionNotFound(f"No versions for key: {key}")
+        ver, path = pairs[-1]
         path.unlink(missing_ok=False)
+
+        # Update last_version in metadata
+        meta = self._load_meta()
+        if pairs[:-1]:
+            meta.prompts[key].last_version = pairs[-2][0]
+        else:
+            meta.prompts[key].last_version = 0
+        self._save_meta(meta)
+
         return PromptVersion(key=key, version=ver, path=path)
 
     def delete_all(self, key: str) -> int:
         ref = self.get_prompt_ref(key)
-        if ref.managed_by_root:
-            pairs = self._scan_default_versions(key)
-            for _, p in pairs:
-                p.unlink(missing_ok=False)
-            # remove directory afterwards
-            try:
-                ref.base_dir.rmdir()
-            except OSError:
-                # Non-empty or in use; ignore
-                pass
-            return len(pairs)
-        # custom-managed
-        pairs = self._scan_custom_versions(key, ref.base_dir)
+        pairs = self._scan_versions(key, ref.version_dir, ref.managed_by_root)
         for _, p in pairs:
             p.unlink(missing_ok=False)
-        # remove metadata entry but never the directory
+        # Try to remove directory if managed by root
+        if ref.managed_by_root:
+            try:
+                ref.version_dir.rmdir()
+            except OSError:
+                pass
+        # Remove from metadata
         meta = self._load_meta()
-        if key in meta.custom_dirs:
-            del meta.custom_dirs[key]
-            self._save_meta(meta)
+        del meta.prompts[key]
+        self._save_meta(meta)
         return len(pairs)
 
     def read_version(self, key: str, version: int | None) -> str:
         ref = self.get_prompt_ref(key)
+        pairs = self._scan_versions(key, ref.version_dir, ref.managed_by_root)
+        if not pairs:
+            raise VersionNotFound(f"No versions for key: {key}")
         if version is None:
-            v, path = self._latest_version_pair(key, ref)
+            _, path = pairs[-1]
             return path.read_text(encoding="utf-8")
-        # specific version
-        if ref.managed_by_root:
-            path = ref.base_dir / f"{version}.md"
+        # Find specific version
+        for v, path in pairs:
+            if v == version:
+                return path.read_text(encoding="utf-8")
+        raise VersionNotFound(f"Version {version} not found for key: {key}")
+
+    def sync_from_source(self, key: str, force: bool = False) -> SyncResult:
+        ref = self.get_prompt_ref(key)
+        meta = self._load_meta()
+        cfg = meta.prompts[key]
+
+        if not ref.source_file.exists():
+            raise SourceFileNotFound(f"Source file not found: {ref.source_file}")
+
+        content = ref.source_file.read_text(encoding="utf-8")
+        current_hash = self._compute_hash(content)
+
+        if not force and current_hash == cfg.last_hash:
+            return SyncResult(
+                key=key,
+                changed=False,
+                old_version=cfg.last_version,
+                new_version=None,
+                message=f"No changes detected for '{key}'",
+            )
+
+        old_version = cfg.last_version
+        next_ver = self._next_version(key, ref.version_dir, ref.managed_by_root)
+        version_path = self._version_path(key, next_ver, ref.version_dir, ref.managed_by_root)
+        atomic_write_text(version_path, content)
+
+        cfg.last_hash = current_hash
+        cfg.last_version = next_ver
+        self._save_meta(meta)
+
+        return SyncResult(
+            key=key,
+            changed=True,
+            old_version=old_version,
+            new_version=next_ver,
+            message=f"Synced '{key}': v{old_version} -> v{next_ver}",
+        )
+
+    def sync_all_sources(self) -> list[SyncResult]:
+        meta = self._load_meta()
+        results: list[SyncResult] = []
+        for key in meta.prompts:
+            try:
+                result = self.sync_from_source(key)
+                results.append(result)
+            except SourceFileNotFound as e:
+                results.append(
+                    SyncResult(
+                        key=key,
+                        changed=False,
+                        old_version=None,
+                        new_version=None,
+                        message=str(e),
+                    )
+                )
+        return results
+
+    def list_source_files(self) -> list[tuple[str, Path]]:
+        meta = self._load_meta()
+        return [(key, self._resolve_path(cfg.source_file)) for key, cfg in meta.prompts.items()]
+
+    def untrack(self, key: str, keep_versions: bool = True) -> None:
+        if not self.key_exists(key):
+            raise PromptNotFound(key)
+
+        if not keep_versions:
+            self.delete_all(key)
         else:
-            path = ref.base_dir / f"{key}-{version}.md"
-        if not path.exists():
-            raise VersionNotFound(f"Version {version} not found for key: {key}")
-        return path.read_text(encoding="utf-8")
+            meta = self._load_meta()
+            del meta.prompts[key]
+            self._save_meta(meta)
