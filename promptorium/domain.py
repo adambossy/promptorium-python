@@ -9,8 +9,9 @@ from typing import Literal
 @dataclass(frozen=True)
 class PromptRef:
     key: str
-    base_dir: Path  # where versions live
-    managed_by_root: bool  # base_dir under <repo-root>/.prompts ?
+    source_file: Path  # path to source of truth file
+    version_dir: Path  # where versions live
+    managed_by_root: bool  # version_dir under <repo-root>/.prompts ?
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,15 @@ class DiffResult:
     segments: Sequence[DiffSegment]
 
 
+@dataclass(frozen=True)
+class SyncResult:
+    key: str
+    changed: bool
+    old_version: int | None
+    new_version: int | None
+    message: str
+
+
 class PromptError(Exception): ...
 
 
@@ -59,3 +69,6 @@ class InvalidKey(PromptError): ...
 
 
 class NoContentProvided(PromptError): ...
+
+
+class SourceFileNotFound(PromptError): ...
