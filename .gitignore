@@ -61,3 +61,6 @@ Desktop.ini
 
 # Environment variables
 .env
+
+# Promptorium data (runtime-generated)
+.prompts/
