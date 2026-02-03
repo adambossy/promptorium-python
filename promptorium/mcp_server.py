@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import os
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -11,7 +13,8 @@ from .services import PromptService
 from .storage.fs import FileSystemPromptStorage
 from .util.repo_root import find_repo_root
 
-mcp = FastMCP("promptorium")
+# Create FastMCP server
+mcp = FastMCP(name="promptorium")
 
 
 def _get_service() -> PromptService:
@@ -256,8 +259,35 @@ def migrate_schema(
 
 
 def run_server() -> None:
-    """Run the MCP server."""
-    mcp.run()
+    """Run the MCP server with configurable transport."""
+    parser = argparse.ArgumentParser(description="Promptorium MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default=os.environ.get("MCP_TRANSPORT", "stdio"),
+        help="Transport type: stdio (default) or sse for HTTP",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("MCP_HOST", "127.0.0.1"),
+        help="Host for SSE transport (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("MCP_PORT", "8080")),
+        help="Port for SSE transport (default: 8080)",
+    )
+    args = parser.parse_args()
+
+    if args.transport == "sse":
+        # Configure host/port via settings for SSE transport
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        mcp.run(transport="sse")
+    else:
+        # Run with stdio transport (default)
+        mcp.run()
 
 
 if __name__ == "__main__":
