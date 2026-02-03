@@ -224,6 +224,37 @@ def diff_versions(key: str, v1: int, v2: int, granularity: str = "word") -> str:
         return f"Error: {e}"
 
 
+@mcp.tool()
+def migrate_schema(
+    from_version: int = 1,
+    to_version: int = 2,
+    prompts_dir: str | None = None,
+) -> str:
+    """Migrate prompt metadata between schema versions.
+
+    Args:
+        from_version: Source schema version (default: 1)
+        to_version: Target schema version (default: 2)
+        prompts_dir: Directory for source files (default: prompts/)
+
+    Returns:
+        Summary of migration results
+    """
+    from .migration import migrate as do_migrate
+
+    try:
+        result = do_migrate(
+            repo_root=find_repo_root(),
+            from_version=from_version,
+            to_version=to_version,
+            prompts_dir=Path(prompts_dir) if prompts_dir else None,
+            interactive=False,  # Non-interactive for MCP
+        )
+        return f"Migrated {result['migrated']} prompt(s) from v{from_version} to v{to_version}"
+    except ValueError as e:
+        return f"Error: {e}"
+
+
 def run_server() -> None:
     """Run the MCP server."""
     mcp.run()

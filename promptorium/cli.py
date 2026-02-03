@@ -175,3 +175,26 @@ def diff(
     except PromptError as e:
         typer.secho(str(e), err=True, fg=typer.colors.RED)
         raise typer.Exit(1)
+
+
+@app.command()
+def migrate(
+    from_version: int = typer.Option(1, "--from", help="Source schema version"),
+    to_version: int = typer.Option(2, "--to", help="Target schema version"),
+    prompts_dir: Path | None = typer.Option(None, "--prompts-dir", help="Directory for source files"),
+) -> None:
+    """Migrate prompt metadata between schema versions."""
+    from .migration import migrate as do_migrate
+
+    try:
+        result = do_migrate(
+            repo_root=find_repo_root(),
+            from_version=from_version,
+            to_version=to_version,
+            prompts_dir=prompts_dir,
+            interactive=True,
+        )
+        typer.echo(f"Migrated {result['migrated']} prompt(s) from v{from_version} to v{to_version}")
+    except ValueError as e:
+        typer.secho(str(e), err=True, fg=typer.colors.RED)
+        raise typer.Exit(1)
